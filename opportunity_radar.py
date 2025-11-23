@@ -384,6 +384,15 @@ col_deep, col_risk = st.columns([2, 1])
 with col_deep:
     st.subheader("🔍 深度透视：Top 1 机会")
     top_symbol = df_res.index[0]
+    samples = sel_row["Prob_N"]
+    edge_z = sel_row["Edge_Z"]
+
+    st.write("---")
+    st.markdown("**统计视角补充说明：**")
+    st.write(f"- 本次经验概率估计共使用历史样本：**{int(samples)}** 个；")
+    st.write(f"- 胜率相对 50% 的 Z 值约为：**{edge_z:.2f}**，"
+             "一般认为 |Z| > 1.96 对应约 95% 的统计显著性；"
+             "样本越多且 Z 值越大，说明这个优势越“可靠”。")
     
     # 选择器
     sel_symbol = st.selectbox("选择币种查看详情", df_res.index, index=0)
@@ -449,4 +458,5 @@ with col_risk:
 
 st.markdown("---")
 st.caption("Alpha 研究员雷达 v2.0 | 基于双周期共振与波动率调整模型")
+
 
