@@ -143,26 +143,92 @@ def check_resonance(score_4h, score_1d):
     else:
         return "无共振", 1.0
 
-def calc_prob_stats(df, factors, horizon=6):
-    """经验概率：历史相似情境下的胜率"""
-    if factors is None: return None, None
-    
-    curr_score = factors["comp_score"].iloc[-1]
-    hist_scores = factors["comp_score"].iloc[:-horizon]
-    fwd_ret = df["close"].shift(-horizon) / df["close"] - 1
+def calc_prob_stats(df, factors, horizon=6,
+                    window=10,   # 相似得分窗口 ±window
+                    min_sim=30,  # 相似样本数 >= 这个值优先用相似样本
+                    min_total=80 # 总历史样本太少时，直接用整体
+                    ):
+    """
+    更严谨的经验概率计算：
+    - 优先用“当前得分附近”的相似样本；
+    - 相似样本太少 -> 用所有历史样本；
+    - 从不再直接返回 0.5；
+    - 额外返回：
+        - n_samples：实际使用的样本数
+        - used_similar：是否使用了相似得分样本
+        - edge_z：胜率相对 50% 的 Z 值（简单统计显著性指标）
+    """
+    if df is None or factors is None:
+        return np.nan, np.nan, 0, False, 0.0
+
+    if len(df) <= horizon + 5:
+        return np.nan, np.nan, 0, False, 0.0
+
+    if "comp_score" not in factors.columns:
+        return np.nan, np.nan, 0, False, 0.0
+
+    closes = df["close"]
+    scores = factors["comp_score"]
+
+    # 未来 horizon 根的收益
+    fwd_ret = closes.shift(-horizon) / closes - 1
+
+    # 为了做配对，把最后 horizon 根去掉
+    hist_scores = scores.iloc[:-horizon]
     fwd_ret = fwd_ret.iloc[:-horizon]
-    
-    # 找相似历史 (±10分)
-    mask = hist_scores.between(curr_score - 10, curr_score + 10)
-    if mask.sum() < 30: # 样本太少就放宽
-        mask = hist_scores.between(curr_score - 20, curr_score + 20)
-        
-    if mask.sum() > 10:
-        samples = fwd_ret[mask]
+
+    mask_valid = hist_scores.notna() & fwd_ret.notna()
+    hist_scores = hist_scores[mask_valid]
+    fwd_ret = fwd_ret[mask_valid]
+
+    if len(fwd_ret) == 0:
+        return np.nan, np.nan, 0, False, 0.0
+
+    # 总样本太少：直接用整体分布
+    if len(fwd_ret) < min_total:
+        samples = fwd_ret
         win_rate = (samples > 0).mean()
         exp_ret = samples.mean()
-        return win_rate, exp_ret
-    return 0.5, 0.0
+        n = len(samples)
+        edge_z = 0.0 if n == 0 else (win_rate - 0.5) / np.sqrt(0.25 / n)
+        return float(win_rate), float(exp_ret), int(n), False, float(edge_z)
+
+    curr_score = scores.iloc[-1]
+    if pd.isna(curr_score):
+        samples = fwd_ret
+        win_rate = (samples > 0).mean()
+        exp_ret = samples.mean()
+        n = len(samples)
+        edge_z = 0.0 if n == 0 else (win_rate - 0.5) / np.sqrt(0.25 / n)
+        return float(win_rate), float(exp_ret), int(n), False, float(edge_z)
+
+    # 先用 ±window 范围内的相似样本
+    sim_mask = hist_scores.between(curr_score - window, curr_score + window)
+    sim_count = sim_mask.sum()
+
+    if sim_count >= min_sim:
+        samples = fwd_ret[sim_mask]
+        used_similar = True
+    elif sim_count >= 10:
+        # 样本不是很多，但也可以看一眼
+        samples = fwd_ret[sim_mask]
+        used_similar = True
+    else:
+        # 相似样本过少，退回整体历史分布
+        samples = fwd_ret
+        used_similar = False
+
+    if len(samples) == 0:
+        return np.nan, np.nan, 0, False, 0.0
+
+    win_rate = (samples > 0).mean()
+    exp_ret = samples.mean()
+    n = len(samples)
+
+    # 简单统计显著性：Z 值（|Z|>1.96 ~ 95% 置信）
+    edge_z = 0.0 if n == 0 else (win_rate - 0.5) / np.sqrt(0.25 / n)
+
+    return float(win_rate), float(exp_ret), int(n), used_similar, float(edge_z)
 
 # =========================
 # 🖥️ Streamlit 页面逻辑
@@ -216,14 +282,21 @@ for symbol in WATCHLIST:
     # 共振判断
     res_label, res_weight = check_resonance(last_4h["comp_score"], last_1d["comp_score"])
     
-    # 经验概率
-    win_rate, exp_ret = calc_prob_stats(df_4h, fac_4h, PROB_HORIZON)
-    
-    # 核心：Alpha 排序分
-    # 逻辑：(4h得分 + 1d得分/2) * 共振加成 * (胜率偏离度)
+      # 经验概率（带样本数 & 显著性）
+    win_rate, exp_ret, n_samples, used_similar, edge_z = calc_prob_stats(
+        df_4h, fac_4h, PROB_HORIZON
+    )
+
+    # 核心：Alpha 排序分（加入显著性权重）
     raw_alpha = (last_4h["comp_score"] + last_1d["comp_score"] * 0.5)
-    alpha_score = raw_alpha * res_weight + (win_rate - 0.5) * 100
-    
+
+    # 统计显著性权重：样本多且 Z 值绝对值大 -> 给予更高权重，最多放大到 1.5 倍
+    sig_weight = 1.0
+    if n_samples >= 30:
+        sig_weight = min(1.5, 0.5 + 0.1 * abs(edge_z))  # Z 每增加 1，多给 0.1，最多 1.5
+
+    alpha_score = (raw_alpha * res_weight + (win_rate - 0.5) * 100) * sig_weight
+
     market_data.append({
         "Symbol": symbol,
         "Price": df_4h["close"].iloc[-1],
@@ -232,9 +305,12 @@ for symbol in WATCHLIST:
         "Resonance": res_label,
         "Win_Rate": win_rate,
         "Exp_Ret": exp_ret,
-        "Smart_Ret": last_4h["smart_ret"], # 风险调整后收益
+        "Smart_Ret": last_4h["smart_ret"],
         "Alpha_Score": alpha_score,
-        "Vol": last_4h["volatility"]
+        "Vol": last_4h["volatility"],
+        "Prob_N": n_samples,
+        "Prob_Mode": "相似分布" if used_similar else "整体分布",
+        "Edge_Z": edge_z
     })
 
 status_box.success("全市场扫描完成。")
@@ -259,12 +335,14 @@ df_res = df_res.sort_values("Alpha_Score", ascending=False)
 # 美化表格显示
 show_df = df_res[[
     "Alpha_Score", "Resonance", "Price", 
-    "4h_Score", "1d_Score", "Win_Rate", "Exp_Ret", "Smart_Ret"
+    "4h_Score", "1d_Score", "Win_Rate", "Exp_Ret", 
+    "Smart_Ret", "Prob_N", "Edge_Z"
 ]].copy()
 
 show_df.columns = [
     "Alpha 排序分", "双周期共振", "当前价格",
-    "4h 评分", "1d 评分", "历史胜率", "期望收益", "风险调整动量"
+    "4h 评分", "1d 评分", "历史胜率", "期望收益",
+    "风险调整动量", "样本数", "胜率偏离Z值"
 ]
 
 # 样式映射
@@ -290,7 +368,9 @@ st.dataframe(
         "1d 评分": "{:.1f}",
         "历史胜率": "{:.1%}",
         "期望收益": "{:.2%}",
-        "风险调整动量": "{:.2f}"
+        "风险调整动量": "{:.2f}",
+        "样本数": "{:.0f}",
+        "胜率偏离Z值": "{:.2f}"
     }).map(color_resonance, subset=["双周期共振"])
       .map(color_score, subset=["4h 评分", "1d 评分"]),
     use_container_width=True,
@@ -369,3 +449,4 @@ with col_risk:
 
 st.markdown("---")
 st.caption("Alpha 研究员雷达 v2.0 | 基于双周期共振与波动率调整模型")
+
