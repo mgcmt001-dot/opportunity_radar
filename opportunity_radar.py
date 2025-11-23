@@ -6,7 +6,6 @@ import plotly.express as px
 from datetime import timedelta
 import requests
 import talib
-import time
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -16,31 +15,22 @@ pd.options.mode.chained_assignment = None
 # ⚙️ 全局配置
 # =========================
 
-# 观察池
 WATCHLIST = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT",
     "ADA-USDT", "DOGE-USDT", "LINK-USDT", "AVAX-USDT",
     "SUI-USDT", "APT-USDT", "OP-USDT", "ARB-USDT"
 ]
 
-# 双周期配置
-TF_MAIN = "4h"  # 战术周期
-TF_TREND = "1d" # 战略周期
+TF_MAIN = "4h"   # 战术周期
+TF_TREND = "1d"  # 战略周期
 
-# 阈值配置
-SCORE_THRESHOLD = 25  # 单周期得分阈值
-RES_CONFIDENCE = 0.8  # 共振置信度系数
-
-# 回溯配置
+SCORE_THRESHOLD = 25        # 单周期判定强弱的阈值
 MAX_LIMIT = 800
-CORR_LOOKBACK = 90    # 计算相关性的周期（根K线）
-
-# 经验概率参数
-PROB_HORIZON = 6      # 4h * 6 = 24h
-
+CORR_LOOKBACK = 90          # 相关性滚动窗口（根K线）
+PROB_HORIZON = 6            # 未来 6 根 4h ≈ 24 小时
 
 # =========================
-# 🛠️ 数据与工具层
+# 🛠️ 工具 & 数据获取
 # =========================
 
 def tf_to_okx_bar(tf: str) -> str:
@@ -51,112 +41,117 @@ def tf_to_okx_bar(tf: str) -> str:
 
 @st.cache_data(ttl=300)
 def fetch_ohlcv(inst_id: str, tf: str, limit: int = 500):
-    """获取 OKX K线数据，带简单的重试机制"""
+    """从 OKX 获取 K 线数据"""
     url = "https://www.okx.com/api/v5/market/candles"
     params = {"instId": inst_id, "bar": tf_to_okx_bar(tf), "limit": limit}
     try:
         r = requests.get(url, params=params, timeout=5)
-        if r.status_code == 200:
-            js = r.json()
-            if js.get("code") == "0" and js.get("data"):
-                cols = ["ts", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"]
-                df = pd.DataFrame(js["data"], columns=cols)
-                df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-                for c in ["open", "high", "low", "close", "vol"]:
-                    df[c] = df[c].astype(float)
-                df = df.set_index("ts").sort_index()
-                return df
+        if r.status_code != 200:
+            return None
+        js = r.json()
+        if js.get("code") != "0" or not js.get("data"):
+            return None
+        cols = ["ts", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"]
+        df = pd.DataFrame(js["data"], columns=cols)
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        for c in ["open", "high", "low", "close", "vol"]:
+            df[c] = df[c].astype(float)
+        df = df.set_index("ts").sort_index()
+        return df
     except Exception:
-        pass
-    return None
+        return None
 
 # =========================
-# 🧠 核心量化引擎
+# 🧠 因子 & 概率引擎
 # =========================
 
-def calc_factors(df: pd.DataFrame):
-    """计算核心因子：趋势、动量、波动"""
-    if df is None or len(df) < 100: return None
-    
+def calc_factors(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算：
+    - 趋势分 trend_score
+    - 综合分 comp_score
+    - 风险调整动量 smart_ret
+    - 波动率 volatility
+    - RSI / ADX
+    """
+    if df is None or len(df) < 100:
+        return None
+
     c = df["close"].values
     h = df["high"].values
     l = df["low"].values
-    
-    # 1. 基础指标
+
     rsi = talib.RSI(c, 14)
     adx = talib.ADX(h, l, c, 14)
     atr = talib.ATR(h, l, c, 14)
-    
-    # MACD
+
     macd, sig, hist = talib.MACD(c, 12, 26, 9)
-    
-    # 布林带位置
     u, m, d = talib.BBANDS(c, 20, 2, 2)
-    bb_pos = (df["close"] - d) / (u - d)
-    
-    # 2. 趋势强度分 (Trend Score)
-    # EMA 斜率 + MACD 柱状图强弱 + ADX
+    # bb_pos = (df["close"] - d) / (u - d)  # 这版暂时不用
+
     ema_fast = talib.EMA(c, 20)
     ema_slow = talib.EMA(c, 50)
     ema_slope = (pd.Series(ema_fast) - pd.Series(ema_slow)) / pd.Series(ema_slow)
-    
-    trend_raw = np.tanh(ema_slope.fillna(0) * 50) * 0.5 + \
-                np.tanh(pd.Series(hist).fillna(0) / (pd.Series(hist).rolling(50).std() + 1e-8)) * 0.3 + \
-                (pd.Series(adx).fillna(0) - 20).clip(0, None) / 50 * 0.2
-    
+
+    # 趋势分：EMA斜率 + MACD强度 + ADX
+    trend_raw = np.tanh(ema_slope.fillna(0) * 50) * 0.5
+    macd_std = pd.Series(hist).rolling(50).std()
+    trend_raw += np.tanh(pd.Series(hist).fillna(0) / (macd_std + 1e-8)) * 0.3
+    trend_raw += ((pd.Series(adx).fillna(0) - 20).clip(0, None) / 50) * 0.2
     trend_score = (trend_raw * 100).clip(-100, 100)
-    
-    # 3. 波动率调整后的收益 (Smart Return)
-    # 类似夏普比率的逻辑：涨幅 / 波动率
+
+    # 风险调整动量：类似“短期夏普”
     ret = df["close"].pct_change()
     vol = ret.rolling(20).std()
     smart_ret = ret.rolling(20).mean() / (vol + 1e-8)
-    
-    # 4. 综合打分
-    # 趋势 (60%) + RSI反转 (20%) + 波动调整动量 (20%)
-    rev_score = (50 - rsi) * 2  # RSI < 30 -> +40分
+
+    # RSI 反转分
+    rev_score = (50 - pd.Series(rsi)) * 2  # RSI<30 -> +40
+
     comp_score = 0.6 * trend_score + 0.2 * rev_score + 0.2 * (smart_ret * 100).clip(-50, 50)
-    
-    # 组装结果
+
     res = pd.DataFrame(index=df.index)
-    res["close"] = c
+    res["close"] = df["close"]
     res["trend_score"] = trend_score
     res["comp_score"] = comp_score
     res["smart_ret"] = smart_ret
     res["volatility"] = vol
     res["adx"] = adx
     res["rsi"] = rsi
-    
+    res["atr"] = atr
     return res
 
-def check_resonance(score_4h, score_1d):
-    """判断双周期共振状态"""
-    # 同向且都足够强
-    if score_4h > SCORE_THRESHOLD and score_1d > SCORE_THRESHOLD:
-        return "多头共振", 2.0  # 强力加分
-    elif score_4h < -SCORE_THRESHOLD and score_1d < -SCORE_THRESHOLD:
-        return "空头共振", 2.0
-    # 4h 强，1d 弱/反向 -> 背离
-    elif abs(score_4h) > SCORE_THRESHOLD and score_4h * score_1d < 0:
-        return "逆势/背离", 0.5 # 降权
-    # 其他
-    else:
-        return "无共振", 1.0
 
-def calc_prob_stats(df, factors, horizon=6,
-                    window=10,   # 相似得分窗口 ±window
-                    min_sim=30,  # 相似样本数 >= 这个值优先用相似样本
-                    min_total=80 # 总历史样本太少时，直接用整体
-                    ):
+def check_resonance(score_4h: float, score_1d: float):
+    """双周期共振标签 + 共振权重"""
+    if np.isnan(score_4h) or np.isnan(score_1d):
+        return "数据不足", 1.0
+
+    if score_4h > SCORE_THRESHOLD and score_1d > SCORE_THRESHOLD:
+        return "多头共振", 2.0
+    if score_4h < -SCORE_THRESHOLD and score_1d < -SCORE_THRESHOLD:
+        return "空头共振", 2.0
+    if abs(score_4h) > SCORE_THRESHOLD and score_4h * score_1d < 0:
+        return "逆势/背离", 0.5
+    return "无共振", 1.0
+
+
+def calc_prob_stats(df: pd.DataFrame, factors: pd.DataFrame,
+                    horizon: int = 6,
+                    window: float = 10.0,
+                    min_sim: int = 30,
+                    min_total: int = 80):
     """
-    更严谨的经验概率计算：
-    - 优先用“当前得分附近”的相似样本；
-    - 相似样本太少 -> 用所有历史样本；
-    - 从不再直接返回 0.5；
-    - 额外返回：
-        - n_samples：实际使用的样本数
-        - used_similar：是否使用了相似得分样本
-        - edge_z：胜率相对 50% 的 Z 值（简单统计显著性指标）
+    更严谨的经验概率估计：
+    - 优先使用 当前得分 ±window 内的历史样本；
+    - 如果相似样本 < min_sim，则退回全部样本；
+    - 永远不会无脑给 0.5，而是给出真实历史比例；
+    - 返回：
+        win_rate: 上涨概率
+        exp_ret: 期望收益
+        n_samples: 实际使用的样本数
+        used_similar: 是否用“相似得分”子样本
+        edge_z: 胜率相对 0.5 的 Z 值（显著性粗略指标）
     """
     if df is None or factors is None:
         return np.nan, np.nan, 0, False, 0.0
@@ -170,10 +165,7 @@ def calc_prob_stats(df, factors, horizon=6,
     closes = df["close"]
     scores = factors["comp_score"]
 
-    # 未来 horizon 根的收益
     fwd_ret = closes.shift(-horizon) / closes - 1
-
-    # 为了做配对，把最后 horizon 根去掉
     hist_scores = scores.iloc[:-horizon]
     fwd_ret = fwd_ret.iloc[:-horizon]
 
@@ -184,7 +176,7 @@ def calc_prob_stats(df, factors, horizon=6,
     if len(fwd_ret) == 0:
         return np.nan, np.nan, 0, False, 0.0
 
-    # 总样本太少：直接用整体分布
+    # 总样本极少：直接用整体
     if len(fwd_ret) < min_total:
         samples = fwd_ret
         win_rate = (samples > 0).mean()
@@ -202,7 +194,7 @@ def calc_prob_stats(df, factors, horizon=6,
         edge_z = 0.0 if n == 0 else (win_rate - 0.5) / np.sqrt(0.25 / n)
         return float(win_rate), float(exp_ret), int(n), False, float(edge_z)
 
-    # 先用 ±window 范围内的相似样本
+    # 先用 ±window 的相似得分区间
     sim_mask = hist_scores.between(curr_score - window, curr_score + window)
     sim_count = sim_mask.sum()
 
@@ -210,11 +202,9 @@ def calc_prob_stats(df, factors, horizon=6,
         samples = fwd_ret[sim_mask]
         used_similar = True
     elif sim_count >= 10:
-        # 样本不是很多，但也可以看一眼
         samples = fwd_ret[sim_mask]
         used_similar = True
     else:
-        # 相似样本过少，退回整体历史分布
         samples = fwd_ret
         used_similar = False
 
@@ -224,76 +214,75 @@ def calc_prob_stats(df, factors, horizon=6,
     win_rate = (samples > 0).mean()
     exp_ret = samples.mean()
     n = len(samples)
-
-    # 简单统计显著性：Z 值（|Z|>1.96 ~ 95% 置信）
     edge_z = 0.0 if n == 0 else (win_rate - 0.5) / np.sqrt(0.25 / n)
 
     return float(win_rate), float(exp_ret), int(n), used_similar, float(edge_z)
 
 # =========================
-# 🖥️ Streamlit 页面逻辑
+# 🖥️ Streamlit 页面
 # =========================
 
 st.set_page_config(page_title="Alpha 研究员雷达", layout="wide")
 
 st.title("🔬 Alpha 研究员级机会雷达")
-st.caption(f"双周期共振 ({TF_MAIN}+{TF_TREND}) · 风险调整动量 · 组合相关性矩阵")
+st.caption(f"双周期共振 ({TF_MAIN} + {TF_TREND}) · 风险调整动量 · 经验胜率 · 相关性矩阵")
 
-# 1. 数据并行获取与处理
 status_box = st.empty()
-status_box.info("正在进行全市场双周期数据扫描与因子计算...")
+status_box.info("正在进行双周期扫描与因子计算...")
 
 market_data = []
-close_matrix = {} # 用于计算相关性
-
+close_matrix = {}
 btc_regime = "未知"
 
 for symbol in WATCHLIST:
-    # 获取双周期数据
     df_4h = fetch_ohlcv(symbol, TF_MAIN, MAX_LIMIT)
     df_1d = fetch_ohlcv(symbol, TF_TREND, MAX_LIMIT)
-    
-    if df_4h is None or df_1d is None: continue
-    
-    # 计算因子
+
+    if df_4h is None or df_1d is None:
+        continue
+
     fac_4h = calc_factors(df_4h)
     fac_1d = calc_factors(df_1d)
-    
-    if fac_4h is None or fac_1d is None: continue
-    
-    # 记录用于计算相关性的序列 (对齐到4h)
+
+    if fac_4h is None or fac_1d is None:
+        continue
+
+    # 用于相关性：4h 收益序列
     close_matrix[symbol] = df_4h["close"].pct_change().tail(CORR_LOOKBACK)
-    
-    # 提取关键值
+
     last_4h = fac_4h.iloc[-1]
     last_1d = fac_1d.iloc[-1]
-    
-    # BTC Regime 判断 (仅一次)
+
+    # BTC 市场状态
     if symbol == "BTC-USDT":
         t_score = last_4h["trend_score"]
-        v_score = last_4h["volatility"]
-        if abs(t_score) > 30 and last_4h["adx"] > 25:
+        vol_now = last_4h["volatility"]
+        adx_now = last_4h["adx"]
+        vol_q80 = fac_4h["volatility"].quantile(0.8)
+
+        if abs(t_score) > 30 and adx_now > 25:
             btc_regime = "趋势市 (Trending)"
-        elif last_4h["volatility"] > fac_4h["volatility"].quantile(0.8):
+        elif pd.notna(vol_now) and pd.notna(vol_q80) and vol_now > vol_q80:
             btc_regime = "高波震荡 (Volatile)"
         else:
             btc_regime = "低波盘整 (Ranging)"
 
-    # 共振判断
-    res_label, res_weight = check_resonance(last_4h["comp_score"], last_1d["comp_score"])
-    
-      # 经验概率（带样本数 & 显著性）
-    win_rate, exp_ret, n_samples, used_similar, edge_z = calc_prob_stats(
+    # 双周期共振
+    res_label, res_weight = check_resonance(
+        last_4h["comp_score"], last_1d["comp_score"]
+    )
+
+    # 经验概率
+    win_rate, exp_ret, n_samples, used_sim, edge_z = calc_prob_stats(
         df_4h, fac_4h, PROB_HORIZON
     )
 
-    # 核心：Alpha 排序分（加入显著性权重）
-    raw_alpha = (last_4h["comp_score"] + last_1d["comp_score"] * 0.5)
+    # Alpha 排序分：多因子 + 共振 + 胜率 + 显著性
+    raw_alpha = (last_4h["comp_score"] + 0.5 * last_1d["comp_score"])
 
-    # 统计显著性权重：样本多且 Z 值绝对值大 -> 给予更高权重，最多放大到 1.5 倍
     sig_weight = 1.0
     if n_samples >= 30:
-        sig_weight = min(1.5, 0.5 + 0.1 * abs(edge_z))  # Z 每增加 1，多给 0.1，最多 1.5
+        sig_weight = min(1.5, 0.5 + 0.1 * abs(edge_z))  # 样本多且Z值大 → 放大一点权重
 
     alpha_score = (raw_alpha * res_weight + (win_rate - 0.5) * 100) * sig_weight
 
@@ -309,33 +298,43 @@ for symbol in WATCHLIST:
         "Alpha_Score": alpha_score,
         "Vol": last_4h["volatility"],
         "Prob_N": n_samples,
-        "Prob_Mode": "相似分布" if used_similar else "整体分布",
+        "Prob_Mode": "相似分布" if used_sim else "整体分布",
         "Edge_Z": edge_z
     })
 
-status_box.success("全市场扫描完成。")
+if not market_data:
+    status_box.error("所有币种数据获取或因子计算失败。")
+    st.stop()
+else:
+    status_box.success(f"已完成 {len(market_data)} 个币种的扫描。")
 
-# 2. 市场概览 (Regime)
-st.markdown("---")
-col_reg, col_best = st.columns([1, 3])
-
-with col_reg:
-    color = "#00C805" if "趋势" in btc_regime else "#FF4B4B" if "高波" in btc_regime else "#FFA500"
-    st.markdown(f"""
-    <div style="padding:15px; border-radius:10px; border:1px solid {color}; background:#111;">
-        <h3 style="margin:0; color:{color}">{btc_regime}</h3>
-        <p style="margin:5px 0 0 0; color:#888; font-size:12px;">BTC 4h 市场状态</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-# 3. 核心雷达表 (DataFrame)
 df_res = pd.DataFrame(market_data).set_index("Symbol")
 df_res = df_res.sort_values("Alpha_Score", ascending=False)
 
-# 美化表格显示
+# =========================
+# 市场状态 & 核心表格
+# =========================
+
+st.markdown("---")
+col_reg, _ = st.columns([1, 3])
+
+with col_reg:
+    color = "#00C805" if "趋势" in btc_regime else "#FF4B4B" if "高波" in btc_regime else "#FFA500"
+    st.markdown(
+        f"""
+        <div style="padding:15px; border-radius:10px; border:1px solid {color}; background:#111;">
+            <h3 style="margin:0; color:{color}">{btc_regime}</h3>
+            <p style="margin:5px 0 0 0; color:#888; font-size:12px;">以 BTC-USDT 4h 为代表的当前市场状态</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+st.subheader("📋 智能机会筛选列表（按 Alpha 排序）")
+
 show_df = df_res[[
-    "Alpha_Score", "Resonance", "Price", 
-    "4h_Score", "1d_Score", "Win_Rate", "Exp_Ret", 
+    "Alpha_Score", "Resonance", "Price",
+    "4h_Score", "1d_Score", "Win_Rate", "Exp_Ret",
     "Smart_Ret", "Prob_N", "Edge_Z"
 ]].copy()
 
@@ -345,21 +344,22 @@ show_df.columns = [
     "风险调整动量", "样本数", "胜率偏离Z值"
 ]
 
-# 样式映射
 def color_resonance(val):
-    color = "#888"
-    if "多头" in val: color = "#00C805"
-    elif "空头" in val: color = "#FF4B4B"
-    elif "背离" in val: color = "#FFA500"
-    return f'color: {color}; font-weight: bold'
+    if "多头" in val:
+        return 'color: #00C805; font-weight: bold'
+    elif "空头" in val:
+        return 'color: #FF4B4B; font-weight: bold'
+    elif "逆势" in val:
+        return 'color: #FFA500; font-weight: bold'
+    return 'color: #BBBBBB'
 
 def color_score(val):
-    color = "#888"
-    if val > 30: color = "#00C805"
-    elif val < -30: color = "#FF4B4B"
-    return f'color: {color}'
+    if val > 30:
+        return 'color: #00C805'
+    elif val < -30:
+        return 'color: #FF4B4B'
+    return 'color: #DDDDDD'
 
-st.subheader("📋 智能机会筛选列表")
 st.dataframe(
     show_df.style.format({
         "Alpha 排序分": "{:.1f}",
@@ -377,69 +377,68 @@ st.dataframe(
     height=500
 )
 
-# 4. 深度分析与风控
+# =========================
+# 深度拆解 & 风控
+# =========================
+
 st.markdown("---")
 col_deep, col_risk = st.columns([2, 1])
 
 with col_deep:
-    st.subheader("🔍 深度透视：Top 1 机会")
-    top_symbol = df_res.index[0]
-    samples = sel_row["Prob_N"]
-    edge_z = sel_row["Edge_Z"]
+    st.subheader("🔍 深度透视：信号拆解")
 
-    st.write("---")
-    st.markdown("**统计视角补充说明：**")
-    st.write(f"- 本次经验概率估计共使用历史样本：**{int(samples)}** 个；")
-    st.write(f"- 胜率相对 50% 的 Z 值约为：**{edge_z:.2f}**，"
-             "一般认为 |Z| > 1.96 对应约 95% 的统计显著性；"
-             "样本越多且 Z 值越大，说明这个优势越“可靠”。")
-    
-    # 选择器
-    sel_symbol = st.selectbox("选择币种查看详情", df_res.index, index=0)
-    
+    default_symbol = df_res.index[0]
+    sel_symbol = st.selectbox("选择一个币种查看细节", df_res.index.tolist(),
+                              index=df_res.index.tolist().index(default_symbol))
+
     sel_row = df_res.loc[sel_symbol]
-    
-    # 绘制共振图
-    # 这里我们不做简单的 K 线，而是做一个 '信号强度' 对比图
-    fig_gauge = go.Figure()
-    
-    fig_gauge.add_trace(go.Bar(
-        y=["1d 趋势", "4h 战术", "历史胜率(偏移)"],
-        x=[sel_row["1d_Score"], sel_row["4h_Score"], (sel_row["Win_Rate"]-0.5)*200],
-        orientation='h',
+
+    fig_bar = go.Figure()
+    fig_bar.add_trace(go.Bar(
+        y=["1d 趋势", "4h 综合", "历史胜率偏移"],
+        x=[sel_row["1d_Score"],
+           sel_row["4h_Score"],
+           (sel_row["Win_Rate"] - 0.5) * 200],
+        orientation="h",
         marker=dict(
-            color=list(map(lambda x: '#00C805' if x>0 else '#FF4B4B', 
-                           [sel_row["1d_Score"], sel_row["4h_Score"], sel_row["Win_Rate"]-0.5]))
+            color=[
+                "#00C805" if sel_row["1d_Score"] > 0 else "#FF4B4B",
+                "#00C805" if sel_row["4h_Score"] > 0 else "#FF4B4B",
+                "#00C805" if sel_row["Win_Rate"] > 0.5 else "#FF4B4B"
+            ]
         )
     ))
-    
-    fig_gauge.update_layout(
-        title=f"{sel_symbol} 信号多维拆解",
-        xaxis_title="信号强度 (左负右正)",
+    fig_bar.update_layout(
+        title=f"{sel_symbol} 多维信号拆解",
+        xaxis_title="信号强度（左负右正）",
         template="plotly_dark",
-        height=300
+        height=320
     )
-    st.plotly_chart(fig_gauge, use_container_width=True)
-    
-    # 文字解读
-    res_note = "✅ 极佳机会" if "共振" in sel_row["Resonance"] else "⚠️ 存在分歧/背离"
-    st.info(f"""
-    **研究员解读**：
-    该币种当前 Alpha 得分为 **{sel_row['Alpha_Score']:.1f}**。
-    双周期状态为 **{sel_row['Resonance']}** ({res_note})。
-    在类似当前评分的历史情境下，未来 24h 上涨概率为 **{sel_row['Win_Rate']:.1%}**。
-    风险调整后的动量因子（Smart Return）为 **{sel_row['Smart_Ret']:.2f}**，
-    { "波动率较低，上涨质量高" if abs(sel_row['Smart_Ret']) > 0.5 else "波动率较高，注意风险" }。
-    """)
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+    # 文本解释
+    res_note = "偏强机会" if "共振" in sel_row["Resonance"] else (
+        "逆势结构，适合短线" if "逆势" in sel_row["Resonance"] else "无明显共振，信号一般"
+    )
+
+    st.info(
+        f"**研究员视角解读**：\n\n"
+        f"- 当前 Alpha 排序分：**{sel_row['Alpha_Score']:.1f}**（兼顾多因子得分、共振与历史胜率）。\n"
+        f"- 双周期状态：**{sel_row['Resonance']}**（{res_note}）。\n"
+        f"- 在历史上“当前得分附近”的情境中，未来约 24 小时上涨概率约为：**{sel_row['Win_Rate']:.1%}**，"
+        f"期望收益约 **{sel_row['Exp_Ret']:.2%}**。\n"
+        f"- 样本数：**{int(sel_row['Prob_N'])}**，胜率相对 50% 的 Z 值约 **{sel_row['Edge_Z']:.2f}**，"
+        f"{'在统计上有一定显著性（|Z|>1.96≈95% 置信）' if abs(sel_row['Edge_Z'])>1.96 else '暂不算非常显著，更多作为参考'}。\n"
+        f"- 风险调整动量（Smart Ret）：**{sel_row['Smart_Ret']:.2f}**，"
+        f"{'说明在单位波动风险下，这段时间上涨质量较高。' if abs(sel_row['Smart_Ret'])>0.5 else '上涨/下跌伴随较大噪音，注意回撤风险。'}"
+    )
 
 with col_risk:
-    st.subheader("🛡️ 组合风控：相关性热力图")
-    st.caption("避免同时持有颜色过深（相关性高）的币种")
-    
-    # 计算相关性矩阵
+    st.subheader("🛡️ 组合相关性热力图")
+    st.caption("避免同时重仓高度相关（深色接近 1）的币种。")
+
     if len(close_matrix) > 1:
         corr_df = pd.DataFrame(close_matrix).corr()
-        
         fig_corr = px.imshow(
             corr_df,
             text_auto=".2f",
@@ -454,9 +453,10 @@ with col_risk:
         )
         st.plotly_chart(fig_corr, use_container_width=True)
     else:
-        st.warning("数据不足，无法计算相关性矩阵")
+        st.warning("数据不足，无法计算相关性矩阵。")
 
 st.markdown("---")
-st.caption("Alpha 研究员雷达 v2.0 | 基于双周期共振与波动率调整模型")
-
-
+st.caption("""
+本工具以研究员视角提供多因子、概率与风险分析，不构成任何投资建议。  
+历史统计不代表未来结果，加密资产波动剧烈，请严格控制仓位与风险。
+""")
