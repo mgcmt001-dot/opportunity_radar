@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import timedelta
 import requests
 import talib
 import warnings
@@ -24,10 +23,10 @@ WATCHLIST = [
 TF_MAIN = "4h"   # 战术周期
 TF_TREND = "1d"  # 战略周期
 
-SCORE_THRESHOLD = 25        # 单周期判定强弱的阈值
-MAX_LIMIT = 800
-CORR_LOOKBACK = 90          # 相关性滚动窗口（根K线）
-PROB_HORIZON = 6            # 未来 6 根 4h ≈ 24 小时
+SCORE_THRESHOLD = 25        # 单周期强弱阈值
+MAX_LIMIT = 800             # 每个周期最多K线数
+CORR_LOOKBACK = 90          # 计算相关性使用的 4h 根数
+PROB_HORIZON = 6            # 经验概率前瞻的 4h 根数（约 24h）
 
 # =========================
 # 🛠️ 工具 & 数据获取
@@ -41,7 +40,7 @@ def tf_to_okx_bar(tf: str) -> str:
 
 @st.cache_data(ttl=300)
 def fetch_ohlcv(inst_id: str, tf: str, limit: int = 500):
-    """从 OKX 获取 K 线数据"""
+    """从 OKX 获取 OHLCV 数据"""
     url = "https://www.okx.com/api/v5/market/candles"
     params = {"instId": inst_id, "bar": tf_to_okx_bar(tf), "limit": limit}
     try:
@@ -62,64 +61,76 @@ def fetch_ohlcv(inst_id: str, tf: str, limit: int = 500):
         return None
 
 # =========================
-# 🧠 因子 & 概率引擎
+# 🧠 因子引擎 & 概率引擎
 # =========================
 
 def calc_factors(df: pd.DataFrame) -> pd.DataFrame:
     """
-    计算：
-    - 趋势分 trend_score
-    - 综合分 comp_score
-    - 风险调整动量 smart_ret
-    - 波动率 volatility
-    - RSI / ADX
+    计算核心因子：
+    - trend_score: 趋势强度
+    - comp_score: 综合评分（趋势 + 反转 + 风险调整动量）
+    - smart_ret: 风险调整动量
+    - volatility: 近 20 根波动率
+    - rsi / adx / atr
     """
-    if df is None or len(df) < 100:
+    if df is None or len(df) < 60:
         return None
 
-    c = df["close"].values
-    h = df["high"].values
-    l = df["low"].values
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+
+    c = close.values
+    h = high.values
+    l = low.values
 
     rsi = talib.RSI(c, 14)
     adx = talib.ADX(h, l, c, 14)
     atr = talib.ATR(h, l, c, 14)
 
     macd, sig, hist = talib.MACD(c, 12, 26, 9)
-    u, m, d = talib.BBANDS(c, 20, 2, 2)
-    # bb_pos = (df["close"] - d) / (u - d)  # 这版暂时不用
-
     ema_fast = talib.EMA(c, 20)
     ema_slow = talib.EMA(c, 50)
-    ema_slope = (pd.Series(ema_fast) - pd.Series(ema_slow)) / pd.Series(ema_slow)
 
-    # 趋势分：EMA斜率 + MACD强度 + ADX
+    ema_slope = (pd.Series(ema_fast, index=df.index) -
+                 pd.Series(ema_slow, index=df.index)) / \
+                pd.Series(ema_slow, index=df.index)
+
+    # 趋势原始分：EMA斜率 + MACD 强度 + ADX
     trend_raw = np.tanh(ema_slope.fillna(0) * 50) * 0.5
-    macd_std = pd.Series(hist).rolling(50).std()
-    trend_raw += np.tanh(pd.Series(hist).fillna(0) / (macd_std + 1e-8)) * 0.3
-    trend_raw += ((pd.Series(adx).fillna(0) - 20).clip(0, None) / 50) * 0.2
+
+    macd_series = pd.Series(hist, index=df.index)
+    macd_std = macd_series.rolling(50).std()
+    trend_raw += np.tanh(macd_series.fillna(0) / (macd_std + 1e-8)) * 0.3
+
+    adx_series = pd.Series(adx, index=df.index)
+    trend_raw += ((adx_series.fillna(0) - 20).clip(0, None) / 50) * 0.2
+
     trend_score = (trend_raw * 100).clip(-100, 100)
 
-    # 风险调整动量：类似“短期夏普”
-    ret = df["close"].pct_change()
+    # 风险调整动量：短期涨幅 / 波动率
+    ret = close.pct_change()
     vol = ret.rolling(20).std()
     smart_ret = ret.rolling(20).mean() / (vol + 1e-8)
 
     # RSI 反转分
-    rev_score = (50 - pd.Series(rsi)) * 2  # RSI<30 -> +40
+    rsi_series = pd.Series(rsi, index=df.index)
+    rev_score = (50 - rsi_series) * 2
 
-    comp_score = 0.6 * trend_score + 0.2 * rev_score + 0.2 * (smart_ret * 100).clip(-50, 50)
+    comp_score = 0.6 * trend_score + 0.2 * rev_score + \
+                 0.2 * (smart_ret * 100).clip(-50, 50)
 
-    res = pd.DataFrame(index=df.index)
-    res["close"] = df["close"]
-    res["trend_score"] = trend_score
-    res["comp_score"] = comp_score
-    res["smart_ret"] = smart_ret
-    res["volatility"] = vol
-    res["adx"] = adx
-    res["rsi"] = rsi
-    res["atr"] = atr
-    return res
+    fac = pd.DataFrame(index=df.index)
+    fac["close"] = close
+    fac["trend_score"] = trend_score
+    fac["comp_score"] = comp_score
+    fac["smart_ret"] = smart_ret
+    fac["volatility"] = vol
+    fac["rsi"] = rsi_series
+    fac["adx"] = adx_series
+    fac["atr"] = pd.Series(atr, index=df.index)
+
+    return fac
 
 
 def check_resonance(score_4h: float, score_1d: float):
@@ -136,47 +147,51 @@ def check_resonance(score_4h: float, score_1d: float):
     return "无共振", 1.0
 
 
-def calc_prob_stats(df: pd.DataFrame, factors: pd.DataFrame,
-                    horizon: int = 6,
-                    window: float = 10.0,
-                    min_sim: int = 30,
-                    min_total: int = 80):
+def calc_prob_stats(
+    df: pd.DataFrame,
+    factors: pd.DataFrame,
+    horizon: int = 6,
+    window: float = 10.0,
+    min_sim: int = 30,
+    min_total: int = 80
+):
     """
-    更严谨的经验概率估计：
-    - 优先使用 当前得分 ±window 内的历史样本；
-    - 如果相似样本 < min_sim，则退回全部样本；
-    - 永远不会无脑给 0.5，而是给出真实历史比例；
-    - 返回：
-        win_rate: 上涨概率
-        exp_ret: 期望收益
-        n_samples: 实际使用的样本数
-        used_similar: 是否用“相似得分”子样本
-        edge_z: 胜率相对 0.5 的 Z 值（显著性粗略指标）
+    经验概率估计（永远不会返回 NaN，最多返回 0.5 / 0）：
+
+    返回：
+    - win_rate: 上涨概率
+    - exp_ret: 期望收益
+    - n_samples: 使用的历史样本数
+    - used_similar: 是否用了“当前得分附近”的相似子样本
+    - edge_z: 胜率相对 0.5 的 Z 值（显著性粗略参考）
     """
     if df is None or factors is None:
-        return np.nan, np.nan, 0, False, 0.0
+        return 0.5, 0.0, 0, False, 0.0
 
-    if len(df) <= horizon + 5:
-        return np.nan, np.nan, 0, False, 0.0
+    # 对齐 close + score 并去掉 NaN
+    tmp = pd.DataFrame({
+        "close": df["close"],
+        "score": factors["comp_score"]
+    }).dropna()
 
-    if "comp_score" not in factors.columns:
-        return np.nan, np.nan, 0, False, 0.0
+    if len(tmp) <= horizon + 5:
+        return 0.5, 0.0, 0, False, 0.0
 
-    closes = df["close"]
-    scores = factors["comp_score"]
+    closes = tmp["close"]
+    scores = tmp["score"]
 
     fwd_ret = closes.shift(-horizon) / closes - 1
-    hist_scores = scores.iloc[:-horizon]
     fwd_ret = fwd_ret.iloc[:-horizon]
+    hist_scores = scores.iloc[:-horizon]
 
-    mask_valid = hist_scores.notna() & fwd_ret.notna()
-    hist_scores = hist_scores[mask_valid]
+    mask_valid = fwd_ret.notna() & hist_scores.notna()
     fwd_ret = fwd_ret[mask_valid]
+    hist_scores = hist_scores[mask_valid]
 
     if len(fwd_ret) == 0:
-        return np.nan, np.nan, 0, False, 0.0
+        return 0.5, 0.0, 0, False, 0.0
 
-    # 总样本极少：直接用整体
+    # 样本极少：直接用整体分布
     if len(fwd_ret) < min_total:
         samples = fwd_ret
         win_rate = (samples > 0).mean()
@@ -194,7 +209,7 @@ def calc_prob_stats(df: pd.DataFrame, factors: pd.DataFrame,
         edge_z = 0.0 if n == 0 else (win_rate - 0.5) / np.sqrt(0.25 / n)
         return float(win_rate), float(exp_ret), int(n), False, float(edge_z)
 
-    # 先用 ±window 的相似得分区间
+    # 相似得分子样本
     sim_mask = hist_scores.between(curr_score - window, curr_score + window)
     sim_count = sim_mask.sum()
 
@@ -209,7 +224,7 @@ def calc_prob_stats(df: pd.DataFrame, factors: pd.DataFrame,
         used_similar = False
 
     if len(samples) == 0:
-        return np.nan, np.nan, 0, False, 0.0
+        return 0.5, 0.0, 0, False, 0.0
 
     win_rate = (samples > 0).mean()
     exp_ret = samples.mean()
@@ -237,29 +252,39 @@ btc_regime = "未知"
 for symbol in WATCHLIST:
     df_4h = fetch_ohlcv(symbol, TF_MAIN, MAX_LIMIT)
     df_1d = fetch_ohlcv(symbol, TF_TREND, MAX_LIMIT)
-
     if df_4h is None or df_1d is None:
         continue
 
     fac_4h = calc_factors(df_4h)
     fac_1d = calc_factors(df_1d)
-
     if fac_4h is None or fac_1d is None:
         continue
 
-    # 用于相关性：4h 收益序列
+    # 只取有完整 comp_score 的最后一根
+    valid_4h = fac_4h.dropna(subset=["comp_score"])
+    valid_1d = fac_1d.dropna(subset=["comp_score"])
+    if len(valid_4h) == 0 or len(valid_1d) == 0:
+        continue
+
+    last_4h = valid_4h.iloc[-1]
+    last_1d = valid_1d.iloc[-1]
+
+    # 价格对齐到最后一根有效因子的时间戳
+    price_time = last_4h.name
+    if price_time in df_4h.index:
+        price = df_4h.loc[price_time, "close"]
+    else:
+        price = df_4h["close"].iloc[-1]
+
+    # 相关性用 4h 收益
     close_matrix[symbol] = df_4h["close"].pct_change().tail(CORR_LOOKBACK)
 
-    last_4h = fac_4h.iloc[-1]
-    last_1d = fac_1d.iloc[-1]
-
-    # BTC 市场状态
+    # BTC Regime
     if symbol == "BTC-USDT":
         t_score = last_4h["trend_score"]
         vol_now = last_4h["volatility"]
         adx_now = last_4h["adx"]
-        vol_q80 = fac_4h["volatility"].quantile(0.8)
-
+        vol_q80 = valid_4h["volatility"].quantile(0.8)
         if abs(t_score) > 30 and adx_now > 25:
             btc_regime = "趋势市 (Trending)"
         elif pd.notna(vol_now) and pd.notna(vol_q80) and vol_now > vol_q80:
@@ -269,7 +294,8 @@ for symbol in WATCHLIST:
 
     # 双周期共振
     res_label, res_weight = check_resonance(
-        last_4h["comp_score"], last_1d["comp_score"]
+        float(last_4h["comp_score"]),
+        float(last_1d["comp_score"])
     )
 
     # 经验概率
@@ -277,29 +303,31 @@ for symbol in WATCHLIST:
         df_4h, fac_4h, PROB_HORIZON
     )
 
-    # Alpha 排序分：多因子 + 共振 + 胜率 + 显著性
-    raw_alpha = (last_4h["comp_score"] + 0.5 * last_1d["comp_score"])
+    # Alpha 排序分
+    raw_alpha = float(last_4h["comp_score"]) + 0.5 * float(last_1d["comp_score"])
 
     sig_weight = 1.0
     if n_samples >= 30:
-        sig_weight = min(1.5, 0.5 + 0.1 * abs(edge_z))  # 样本多且Z值大 → 放大一点权重
+        sig_weight = min(1.5, 0.5 + 0.1 * abs(edge_z))
 
     alpha_score = (raw_alpha * res_weight + (win_rate - 0.5) * 100) * sig_weight
 
+    smart_ret_val = float(last_4h["smart_ret"]) if not np.isnan(last_4h["smart_ret"]) else 0.0
+
     market_data.append({
         "Symbol": symbol,
-        "Price": df_4h["close"].iloc[-1],
-        "4h_Score": last_4h["comp_score"],
-        "1d_Score": last_1d["comp_score"],
+        "Price": price,
+        "4h_Score": float(last_4h["comp_score"]),
+        "1d_Score": float(last_1d["comp_score"]),
         "Resonance": res_label,
-        "Win_Rate": win_rate,
-        "Exp_Ret": exp_ret,
-        "Smart_Ret": last_4h["smart_ret"],
-        "Alpha_Score": alpha_score,
-        "Vol": last_4h["volatility"],
-        "Prob_N": n_samples,
+        "Win_Rate": float(win_rate),
+        "Exp_Ret": float(exp_ret),
+        "Smart_Ret": smart_ret_val,
+        "Alpha_Score": float(alpha_score),
+        "Vol": float(last_4h["volatility"]) if not np.isnan(last_4h["volatility"]) else np.nan,
+        "Prob_N": int(n_samples),
         "Prob_Mode": "相似分布" if used_sim else "整体分布",
-        "Edge_Z": edge_z
+        "Edge_Z": float(edge_z)
     })
 
 if not market_data:
@@ -324,7 +352,9 @@ with col_reg:
         f"""
         <div style="padding:15px; border-radius:10px; border:1px solid {color}; background:#111;">
             <h3 style="margin:0; color:{color}">{btc_regime}</h3>
-            <p style="margin:5px 0 0 0; color:#888; font-size:12px;">以 BTC-USDT 4h 为代表的当前市场状态</p>
+            <p style="margin:5px 0 0 0; color:#888; font-size:12px;">
+                以 BTC-USDT 4h 为代表的当前市场状态
+            </p>
         </div>
         """,
         unsafe_allow_html=True
@@ -388,17 +418,22 @@ with col_deep:
     st.subheader("🔍 深度透视：信号拆解")
 
     default_symbol = df_res.index[0]
-    sel_symbol = st.selectbox("选择一个币种查看细节", df_res.index.tolist(),
-                              index=df_res.index.tolist().index(default_symbol))
+    sel_symbol = st.selectbox(
+        "选择一个币种查看细节",
+        df_res.index.tolist(),
+        index=df_res.index.tolist().index(default_symbol)
+    )
 
     sel_row = df_res.loc[sel_symbol]
 
     fig_bar = go.Figure()
     fig_bar.add_trace(go.Bar(
         y=["1d 趋势", "4h 综合", "历史胜率偏移"],
-        x=[sel_row["1d_Score"],
-           sel_row["4h_Score"],
-           (sel_row["Win_Rate"] - 0.5) * 200],
+        x=[
+            sel_row["1d_Score"],
+            sel_row["4h_Score"],
+            (sel_row["Win_Rate"] - 0.5) * 200
+        ],
         orientation="h",
         marker=dict(
             color=[
@@ -416,7 +451,6 @@ with col_deep:
     )
     st.plotly_chart(fig_bar, use_container_width=True)
 
-    # 文本解释
     res_note = "偏强机会" if "共振" in sel_row["Resonance"] else (
         "逆势结构，适合短线" if "逆势" in sel_row["Resonance"] else "无明显共振，信号一般"
     )
@@ -425,12 +459,12 @@ with col_deep:
         f"**研究员视角解读**：\n\n"
         f"- 当前 Alpha 排序分：**{sel_row['Alpha_Score']:.1f}**（兼顾多因子得分、共振与历史胜率）。\n"
         f"- 双周期状态：**{sel_row['Resonance']}**（{res_note}）。\n"
-        f"- 在历史上“当前得分附近”的情境中，未来约 24 小时上涨概率约为：**{sel_row['Win_Rate']:.1%}**，"
-        f"期望收益约 **{sel_row['Exp_Ret']:.2%}**。\n"
-        f"- 样本数：**{int(sel_row['Prob_N'])}**，胜率相对 50% 的 Z 值约 **{sel_row['Edge_Z']:.2f}**，"
-        f"{'在统计上有一定显著性（|Z|>1.96≈95% 置信）' if abs(sel_row['Edge_Z'])>1.96 else '暂不算非常显著，更多作为参考'}。\n"
+        f"- 在历史上当前得分附近的情境中，未来约 24 小时上涨概率约：**{sel_row['Win_Rate']:.1%}**，"
+        f"期望收益约：**{sel_row['Exp_Ret']:.2%}**。\n"
+        f"- 参与估计的历史样本数：**{sel_row['Prob_N']}**，胜率相对 50% 的 Z 值约：**{sel_row['Edge_Z']:.2f}**，"
+        f"{'在统计上有一定显著性（|Z| > 1.96 ≈ 95% 置信）' if abs(sel_row['Edge_Z'])>1.96 else '显著性一般，可作为参考而非绝对依据'}。\n"
         f"- 风险调整动量（Smart Ret）：**{sel_row['Smart_Ret']:.2f}**，"
-        f"{'说明在单位波动风险下，这段时间上涨质量较高。' if abs(sel_row['Smart_Ret'])>0.5 else '上涨/下跌伴随较大噪音，注意回撤风险。'}"
+        f"{'说明在单位波动风险下，近期上涨质量较高。' if abs(sel_row['Smart_Ret'])>0.5 else '近期涨跌伴随较大噪音，需警惕回撤。'}"
     )
 
 with col_risk:
